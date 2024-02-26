@@ -464,6 +464,8 @@ taskset -c 0,10 ./sched 2 100 1
 
 #### 8.3 双核(4个进程)
 
+
+
 ```bash
 taskset -c 0,10 ./sched 4 100 1
 ./txt2png tmp1.txt res1.png
@@ -561,4 +563,218 @@ taskset -c 0,10 ./sched 4 100 1
 ![](https://pic.imgdb.cn/item/65db03ee9f345e8d037f32d5.jpg)
 
 > 此时我已经学习了 2h23min ，运行时间基本上都这么大，但是大部分系统程序处于睡眠态，未被执行。
+
+### 12. 变更优先级
+
+此前，我们介绍的都是系统均等分配 CPU 时间给所有可以运行的进程。但是，也可以使用 `nice()` 为特定的进程指定优先级。
+
+```c++
+ int nice(int inc);
+```
+
+* `inc` 可以取得 [-19, 20] 之间的整数，数字越大优先级越小，优先级越大，可以获得更多的 CPU 时间
+
+下面，考虑修改 `sched.cpp`  为 `sched_nice.cpp` 实现：
+
+* 将运行的进程数量固定为 `2` 个。
+* 第 `1` 个参数为 `total`，第 `2` 个参数为 `resol`
+* 将 `2` 个进程的优先级分别设为默认的 `0` 和 `5`
+* 剩余部分与原本的 `sched` 程序保持一致
+
+> sched_nice.cpp
+
+```c++
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <bits/stdc++.h>
+#include <unistd.h>
+#include <err.h>
+#include <time.h>
+#include <memory>
+
+constexpr uint64_t NLOOP_FOR_ESTIMATION = 1000000000ULL;
+constexpr uint64_t NSECS_PER_MSEC = 1000000ULL;
+constexpr uint64_t NSECS_PER_SEC = 1000000000ULL;
+
+// timespec {tv_sec, tv_nsec} 秒数，纳秒
+constexpr uint64_t calc(timespec t) {
+	return t.tv_sec * NSECS_PER_SEC + t.tv_nsec;
+}
+
+static inline int64_t diff_nsec(timespec before, timespec after) {
+	return calc(after) - calc(before);
+}
+
+static uint64_t loops_per_msec() {
+	timespec before, after;
+	clock_gettime(CLOCK_MONOTONIC, &before);
+	
+	// 执行空循环测试循环指定次数，需要的 CPU 运行时间
+	for (uint64_t i = 0;i < NLOOP_FOR_ESTIMATION;i ++);
+
+	clock_gettime(CLOCK_MONOTONIC, &after);
+	
+	// 返回每 ms 运行的循环的次数
+	return NLOOP_FOR_ESTIMATION * NSECS_PER_MSEC / diff_nsec(before, after);
+}
+
+static inline void load(uint64_t nloop) {
+	for (uint64_t i = 0;i < nloop;i ++ );
+}
+
+FILE *out1, *out2;
+static void child_fn(int id, std::shared_ptr<timespec[]> buf, int nrecord, uint64_t nloop_per_resol, \
+		timespec start, FILE* out1, FILE* pic2) {
+
+	for (int i = 0;i < nrecord;i ++ ) {
+		timespec ts;
+		load(nloop_per_resol);// 模拟每个 resol 收集一次数据		
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		buf[i] = ts;
+	}
+	// 进程id & 每个resol距开始的 ms 数 & 运行进度
+	for (int i = 0;i < nrecord;i ++ ) {
+		// printf("%d\t%ld\t%d\n", id, diff_nsec(start, buf[i]) / NSECS_PER_MSEC, \
+		//     (i + 1) * 100 / nrecord);
+		int finish_rate = (i + 1) * 100 / nrecord;
+		uint64_t cost_time = diff_nsec(start, buf[i]) / NSECS_PER_MSEC;
+		fprintf(out2, "%llu %d\n", cost_time, finish_rate);
+		fprintf(out1, "%llu %d\n", cost_time, id);
+	}
+	exit(EXIT_SUCCESS);
+}
+
+std::shared_ptr<pid_t[]> pids;
+
+
+// args = 命令行参数 + 1
+int main(int args, char *argv[]) {
+	out1 = fopen("tmp1.txt", "w"); // 打开名为tmp1.txt的文件，以写入模式打开
+    out2 = fopen("tmp2.txt", "w"); // 打开名为tmp2.txt的文件，以写入模式打开
+	if (args !=  3) {
+		fprintf(stderr, "usage: %s <total[ms]> <resolution[ms]>\n", argv[0]);
+		exit(EXIT_FAILURE);
+	}
+
+	int nproc = 2;
+	int total = atoi(argv[1]);
+	int resol = atoi(argv[2]);
+	
+	// std::cout << "pars: " << nproc << " " << total << " " << resol << std::endl;
+	 // 下面是对于命令行参数错误使用的输出
+	std::vector<std::string> names = {"total", "resol"};
+	for (int i = 0;i < 2;i ++ ) {
+		int x = atoi(argv[i + 1]);
+		if (x < 1) {
+			fprintf(stderr, "<%s>(%d) should be >= 1\n", names[i].c_str(), x);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	if (total % resol) {
+		fprintf(stderr, "<total>(%d) should multiple of <resolution>(%d)\n", total, resol);
+		exit(EXIT_FAILURE);
+	}
+	
+ 	int nrecord = total / resol; // 收集信息的次数 
+ 	 // 申请动态的 timespec 结构体指针		
+ 	std::shared_ptr<timespec[]> logbuf(new timespec[nrecord]);
+
+	if (!logbuf) {
+		err(EXIT_FAILURE, "new(logbuf) failed");
+	}
+
+	puts("estimating workload which takes just one milisecond");
+	uint64_t nloop_per_resol = loops_per_msec() * resol;
+	puts("end estimation");
+	fflush(stdout);
+
+	pids = std::shared_ptr<pid_t[]>(new pid_t[nproc]);
+	if (!pids) {
+		warn("new(pids) failed");
+	}
+
+	timespec start;
+	clock_gettime(CLOCK_MONOTONIC, &start);
+
+	for (int i = 0;i < nproc;i ++ ) {
+		pids[i] = fork();
+		if (pids[i] < 0) {
+			// fork() 失败，代表实验失败，父进程杀掉所有子进程
+			for (int j = 0;j < i;j ++ ) 
+				if (kill(pids[i], SIGINT) < 0) 
+					warn("kill (%d) failed", pids[i]);
+			// 等待子进程全部退出，确保父进程回收所有子进程的资源
+			for (int j = 0;j < i;j ++ ) 
+				if (wait(NULL) < 0) 
+					warn("wait() failed.");
+			exit(EXIT_FAILURE);
+		} else if (pids[i] == 0) {
+			 // 子进程		
+             if (i == 1) nice(5);
+			 child_fn(i, logbuf, nrecord, nloop_per_resol, start, out1, out2);
+			 // 此前该个子进程已经结束，要么在 wait(NULL) 后被收回资源，要么等待父进程收回
+		}
+
+	}
+
+	 // 运行到这，说明成功创建了 nproc 个并行子进程
+	for (int i = 0;i < nproc;i ++ ) 
+		if (wait(NULL) < 0) 
+			warn("wait() failed.");
+	;
+	exit(EXIT_SUCCESS);
+}
+```
+
+接着运行：
+
+```bash
+taskset -c 0 ./sched_nice 100 1
+./txt2png tmp1.txt res1.png
+./txt2png tmp2.txt res2.png
+```
+
+得到结果：
+
+![](https://pic.imgdb.cn/item/65dc1a5c9f345e8d039dea45.jpg)
+
+* 可以看到，进程0的优先级更大，确实被分配了更多的 CPU 时间，使得其能更快地完成。
+
+同时 `bash` 里也可以使用 `nice -n`  来指定程序运行的的优先级：
+
+```bash
+nice -n 5 echo hello
+```
+
+`sar` 指令的 `%nice` 字段，表示的是程序在默认值更改为其它优先级后，进程运行时间所占的比例：
+
+输入：
+
+```bash
+$ ./loop &
+[1] 799
+
+$ sar -P ALL 1 1
+Linux 5.15.133.1-microsoft-standard-WSL2 (syz)  02/26/24        _x86_64_        (20 CPU)
+
+13:02:36        CPU     %user     %nice   %system   %iowait    %steal     %idle
+13:02:37          8    100.00      0.00      0.00      0.00      0.00      0.00
+
+$ kill 799
+
+$ nice -n 5 ./loop &
+[2] 802
+[1]   Terminated              ./loop
+
+$ sar -P ALL 1 1
+Linux 5.15.133.1-microsoft-standard-WSL2 (syz)  02/26/24        _x86_64_        (20 CPU)
+
+13:03:11        CPU     %user     %nice   %system   %iowait    %steal     %idle
+13:03:12          8      0.00    100.00      0.00      0.00      0.00      0.00
+```
+
+
+
+* 观察上述输出，前者(默认优先级)是，`%user` 字段为 `100%`，后者 (`nice -n 5`) 是 `%nice` 字段为 `100%`
 
