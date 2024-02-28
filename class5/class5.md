@@ -135,5 +135,131 @@ Linux 通过 **内存管理系统** 管理内存，除了各种进程以外，�
 
 ##### 1. 创建进程时
 
-首先内核读取可执行文件，根据可执行文件的辅助信息将其 **代码段 + 数据段** 复制到内存，例如：
+首先内核读取可执行文件，根据可执行文件的辅助信息将其 **代码段 + 数据段** 复制到内存上一块大小为 300 的区域，例如：
 
+![](https://pic.imgdb.cn/item/65def3979f345e8d03ee089f.jpg)
+
+当复制完成后，根据当前代码段和数据段在内存的实际地址，创建该进程的页表，将虚拟地址映射到物理地址。
+
+![](https://pic.imgdb.cn/item/65def5c69f345e8d03f367db.jpg)
+
+然后从程序入口处地址 **0**，对应实地址 **500** 开始运行程序。
+
+##### 2. 在动态分配内存
+
+如果进程请求更多内存，内核将为其分配新的内存，创建相应的页表，然后把新分配的内存的物理地址对应的虚拟地址返回给进程，例如：
+
+![](https://pic.imgdb.cn/item/65def6f29f345e8d03f6f941.jpg)
+
+#### 4.4 实验
+
+我们需要实现以下 $3$ 个功能的程序：
+
+* 显示进程的内存映射信息：(`/proc/[pid]/maps` 的输出)
+* 额外回获取 `100mb` 的内存
+* 再次显示内存映射的信息
+
+> mmap.cpp
+
+```c++
+#include <unistd.h>
+#include <sys/mman.h>
+#include <bits/stdc++.h>
+#include <err.h>
+
+constexpr int BUFFER_SIZE = 1000;
+constexpr int ALLOC_SIZE = 100 * 1024 * 1024;
+
+static char command[BUFFER_SIZE];
+
+int main() {
+        pid_t pid = getpid();
+        snprintf(command, BUFFER_SIZE, "cat /proc/%d/maps", pid);
+
+        std::cout << "*** Mem map before allocation ***" << std::endl;
+        system(command);
+
+        void *new_memory = mmap(NULL, ALLOC_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+        if (new_memory == (void *) -1)
+                err(EXIT_FAILURE, "mmap() failed");
+        std::cout << std::endl;
+
+        printf("*** succeeded to allocate memory: address = %p; size = 0x%x ***\n", new_memory, ALLOC_SIZE);
+        std::cout << std::endl;
+
+        std::cout << "*** Mem map after allocation ***" << std::endl;
+        system(command);
+		
+    	// 解除申请的 100mb 的内存
+        if (munmap(new_memory, ALLOC_SIZE) == -1)
+                        err(EXIT_FAILURE, "munmap() failed");
+        return 0;
+
+}
+```
+
+> `system()` 实现了一种简单的类似 fork-and-exec 的功能
+
+运行编译后的可执行程序，得到：
+
+```
+*** Mem map before allocation ***
+...
+55c818a13000-55c818a34000 rw-p 00000000 00:00 0                          [heap]
+7f3d6c9fd000-7f3d6ca01000 rw-p 00000000 00:00 0
+...
+
+*** succeeded to allocate memory: address = 0x7f3d665fd000; size = 0x6400000 ***
+
+*** Mem map after allocation ***
+...
+55c818a13000-55c818a34000 rw-p 00000000 00:00 0                          [heap]
+7f3d665fd000-7f3d6ca01000 rw-p 00000000 00:00 0
+....
+```
+
+可以发现申请 `100MB` 空间后，`7f3d6c9fd000-7f3d6ca01000` 变成了 `7f3d665fd000-7f3d6ca01000`，多出了内存：
+
+然后通过 
+
+```bash
+syz@syz:~/projects/class5$ python3 -c "print(- 0x7f3d665fd000 +  0x7f3d6c9fd000)"
+104857600
+```
+
+#### 4.5 利用上层进行分配
+
+c 语言中存在一个名为 `malloc` 的函数，也是内存申请相关，Linux 中，该函数底层用到了 `mmap()`
+
+`mmap()` 是以页为单位获取内存的，而 `malloc()` 是以字节为单位获取内存的，为了以字节为单位获取内存，`glibc` 事先通过系统调用 `mmap()` 向内核申请一大块内存区域作为内存池，程序调用 `malloc` ，`glibc` 会划分相应内存给程序，当内存池内存消耗完，`glibc`  会再次调用 `mmap()` 申请新的内存区域。
+
+![](https://pic.imgdb.cn/item/65df07b19f345e8d031f90d0.jpg)
+
+
+
+一般来说 Linux 显示进程的内存消耗大于程序统计自身内存消耗量，程序自身内存消耗量一般统计 `malloc()` 申请的那部分，而 LInux 显示的是创建进程消耗的内存，以及进程通过 `mmap()` 分配的所有内存。
+
+> 即使是 python 其底层，仍然是通过 c 语言的 malloc 来获取内存。
+
+#### 4.6 解决问题
+
+**内存碎片化**
+
+只需要设计好页表，就能将物理内存上的碎片整合成虚拟地址空间上的一篇连续的内存区域，类似：
+
+![](https://pic.imgdb.cn/item/65df0f619f345e8d0331f1bc.jpg)
+
+**访问用于其他用途的内存区域**
+
+虚拟地址空间是每个进程独有的，页表也是每个进程独有的，因此进程根本无法访问其它进程的内存，类似：
+
+![](https://pic.imgdb.cn/item/65df105e9f345e8d03345971.jpg)
+
+但是一般处于方便，内核的内存区域被映射到了所有进程的虚拟地址空间中。但是与内核相关的页表项都标有 "内核模式专用"  的信息，只有在 cpu 处于内核模式才能进行访问，因此这部分内存也不会在用户模式下被意外访问，类似：
+
+![](https://pic.imgdb.cn/item/65df11829f345e8d03374957.jpg)
+
+**难以执行多任务**
+
+每个进程拥有独立的虚拟地址空间，不用担心干扰其它程序的运行。
