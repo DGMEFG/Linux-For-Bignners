@@ -751,3 +751,270 @@ Thu Feb 29 21:36:33 CST 2024: target process seems to be finished
 
 
 
+#### 5.3 写时复制
+
+ 之前提到 `fork()` 将父进程的所有内存直接复制给子进程，现在使用虚拟内存机制，我们可以仅仅将父进程页表复制给子进程。虽然此时父子进程的页表项都有标有写入权限的字段，但是此时二者都无法进行写入：
+
+![](https://pic.imgdb.cn/item/65e167099f345e8d034e131f.jpg)
+
+此后，如果父子进程都只进行读取操作，那么父子进程就可以共享这块物理内存(节省内存)；当有一方打算修改这部分的数据，按照下述流程解除共享：
+
+* 因为没有写入权限，尝试写入时，cpu 触发缺页中断
+* cpu 转换到内核模式，缺页中断机构开始运行
+* 对于被访问的页面，缺页中断机构将复制一份放到别的地方，然后为其分配给尝试写入的进程，并根据请求更新其中的内容。
+* 为父进程和子进程双方更新与已解除共享的页面对应的页表项
+  * 对于执行写入操作的一方，将其页表项重新连接到新分配的物理页面，并赋予写入权限
+  * 对于另一方，也只需对其页表项重新赋予写入权限即可
+
+![](https://pic.imgdb.cn/item/65e169af9f345e8d03551269.jpg)
+
+> 物理内存并非在发起 `fork()` 系统调用时进行复制，而是在尝试写入时复制，所以这个机制称为 `写时复制`
+>
+> 因此，即使调用 `fork()` 成功，如果引发缺页中断的时候，没有充足的物理内存，也会引发内存不足的问题。
+
+**实验**
+
+下面，我们通过实验来观察发生写时复制的情形，需要确认：
+
+* 在从调用 `fork()` 到开始写入的这段时间，内存区域是否由父子进程共享
+* 在向内存区域执行写入时，是否引发缺页中断。
+
+因此，我们需要编写实现下述要求的程序：
+
+* 获取 `100MB` 内存，并访问所有页面
+* 确认系统的内存使用量
+* 调用 `fork()` 系统调用
+  * 父进程和子进程分别执行以下处理
+  * 父进程：等待子进程结束运行
+  * 子进程：
+    * 显示系统的内存使用量以及自身虚拟内存使用量，物理内存使用量，硬性页缺失发生次数和软性页缺失发生次数
+    * 访问申请到的 `100MB` 的所有空间
+    * 再次显示系统的内存使用量以及自身的虚拟内存使用量，物理内存使用率，硬性页缺失发生次数和软性页缺失发生次数
+
+> grep 正则表达式：
+>
+> `ps -eo pid,comm | grep '^ *[pid] '` ：可以匹配以 `pid` 开头的一行的文本
+
+
+
+> cow.cpp
+
+```c++
+#include <sys/wait.h>
+#include <unistd.h>
+#include <iostream>
+#include <cstring>
+#include <err.h>
+
+constexpr int BUFFER_SIZE = 100 * 1024 * 1024;
+constexpr int PAGE_SIZE = 4096;
+constexpr int COMMAND_SIZE = 4096;
+
+char *p;
+char command[COMMAND_SIZE];
+
+void child_fn() {
+        std::cout << "*** child ps info before memory access ***:" << std::endl;
+        snprintf(command, COMMAND_SIZE,\
+                        "ps -eo pid,comm,vsz,rss,min_flt,maj_flt | grep '^ *%d '", getpid());
+
+        system(command);
+        std::cout << "*** free memory info before memory access ***:" << std::endl;
+        system("free");
+
+        // 按页为单位进行写时复制
+        for (int i = 0;i < BUFFER_SIZE;i += PAGE_SIZE) {
+                p[i] = 1;
+        }
+        std::cout << "*** child ps info after memory access ***:" << std::endl;
+        system(command);
+
+        std::cout << "*** free memory info after memory access ***:" << std::endl;
+        system("free");
+        exit(EXIT_SUCCESS);
+}
+
+void parent_fn() {
+        wait(NULL), exit(EXIT_SUCCESS);
+}
+
+int main() {
+        // 获取 `100MB` 内存，并访问所有页面
+        p = (char*)malloc(BUFFER_SIZE);
+        if (!p) {
+                err(EXIT_FAILURE, "malloc() failed");
+        }
+        for (int i = 0;i < BUFFER_SIZE;i += PAGE_SIZE) {
+                p[i] = 0;
+        }
+        std::cout << "*** free memory info before fork ***:" << std::endl;
+        system("free");
+
+        pid_t ret = fork();
+        if (ret == -1) {
+                err(EXIT_FAILURE, "fork() failed");
+        }
+
+        if (ret == 0) child_fn();
+        else parent_fn();
+
+        err(EXIT_FAILURE, "shouldn't reach here");
+}
+```
+
+编译运行后结果为：
+
+```bash
+syz@syz:~/projects/class5$ ./cow
+*** free memory info before fork ***:
+               total        used        free      shared  buff/cache   available
+Mem:         7942516      650164     6880448        3352      411904     7056212
+Swap:        2097152           0     2097152
+*** child ps info before memory access ***:
+# pid & comm & vsz & rss & min_flt & maj_flt
+   1366 cow             108464 103684    29      0
+*** free memory info before memory access ***:
+               total        used        free      shared  buff/cache   available
+Mem:         7942516      650664     6879948        3352      411904     7055712
+Swap:        2097152           0     2097152
+*** child ps info after memory access ***:
+# pid & comm & vsz & rss & min_flt & maj_flt
+   1366 cow             108464 103684 25629      0
+*** free memory info after memory access ***:
+               total        used        free      shared  buff/cache   available
+Mem:         7942516      752724     6777888        3352      411904     6953652
+Swap:        2097152           0     2097152
+```
+
+
+
+可以看到：
+
+* 子进程在没有修改共享物理内存空间的内容时，内存使用量一直都是 `650164KB`（系统还在运行其它程序），当子进程访问并修改所有页面后(总共 `100MB` 的内容)，系统内存使用量约为 `99.66796875MB`
+* 当子进程访问并且修改共享物理内存的内容时，发生 `min_flt` 的次数由 `29` 上升到 `25629`
+
+* 子进程通过 `ps -eo` 输出的 `vsz,rss` 没有变化，是因为子进程并没有进行申请内存操作。
+
+#### 5.4 Swap
+
+当物理内存耗尽，系统会进入 `OOM` 状态，Linux 提供了一个针对 `OOM` 的补救措施，即  `Swap`。
+
+这一功能使得我们可以将外部存储器的一部分容量暂时当作内存使用。当物理内存不足的情况下，出现获取物理内存的申请时，物理内存的一部分页面保存到外部存储器中，这里用于保存页面的区域称为 **交换分区** (Windows 系统这被称为 **虚拟内存**)，交换分区由管理员在构建系统时设置。
+
+当物理内存不足时候，此时如果需要更多的物理内存，触发缺页中断，然后通过某种算法确定换出内存的页区，将其移外存中。这里显示被换出页面在交换分区的上的地址信息记录在页表项里，实际上是记录在内核中专门用于管理交换分区的区域上。
+
+![](https://pic.imgdb.cn/item/65e412a69f345e8d032d4544.jpg)
+
+然后多出来的空闲内存分配给进程 `B`，接着当程序释放了一些进程的内存后，如果进程 `A ` 对于先前保存到交换分区的页面发起访问，就会发生缺页中断：
+
+![](https://pic.imgdb.cn/item/65e4146e9f345e8d03327217.jpg)
+
+接着执行 **换入**:
+
+![](https://pic.imgdb.cn/item/65e415239f345e8d0334c642.jpg)
+
+> 程序必须放在内存上然后加载到 cpu 上执行，因此当你需要运行某一段，而物理内存不足，此时会将一个或者多个现在暂时不需要的页面换出到 Swap，等你需要运行被换出的那一段程序，(如果物理内存仍然不足) 它会将内存中现在暂时不需要的页面换出到 Swap，将你现在需要运行的程序换入到内存中。
+
+`Swap` 看起来是一个将可用内存量扩充为 `实际搭载内存 + 交换分区内存`，但是相比于内存的访问速度，对普通外部存储器的访问速度慢了几个数量级。
+
+如果物理内存不足，就容易发生 **系统抖动** ，系统暂时无法响应。
+
+**实验**
+
+通过 `swapon --show`可以查看系统交换分区的信息
+
+![](https://pic.imgdb.cn/item/65e418d39f345e8d033ef5e4.jpg)
+
+交换分区内存大小约为 `2GB`
+
+还可以通过 `free` 查看交换分区的内存：
+
+![](https://pic.imgdb.cn/item/65e4192b9f345e8d033fee35.jpg)
+
+系统运行期间 ，定期通过 `sar -W` 可以查看系统中是否发生了交换处理。
+
+![](https://pic.imgdb.cn/item/65e4198d9f345e8d0341196f.jpg)
+
+> pswpin:每sec发生换入的次数，pswpout:每sec发生换出的次数
+
+使用 `sar -S 1` 可以确认该交换处理是暂时的，还是毁灭性的：
+
+![](https://pic.imgdb.cn/item/65e41a449f345e8d03433fe5.jpg)
+
+当 `kbswapused` 字段值了解交换分区使用量的变化趋势，如果这个值增加就会很危险。
+
+这里补充一下缺页中断的知识：
+
+* **硬性页缺失**：需要访问外部存储器的缺页中断
+* **软性页缺失**：无需访问外部存储器的缺页中断
+
+二者都需要经过内核进行处理，硬性页缺失产生的影响越大。
+
+#### 5.5 多级页表
+
+`x86_64` 架构上，虚拟地址空间一般大小为 `128TB`，页面大小为 `4KB`，页表项大小为 `8B`，那么创建一个页表就需要：
+$$
+8\mathrm{B} \times128 \mathrm{TB} / 4\mathrm{KB}  = 256\mathrm{GB}
+$$
+正常来说现在一般计算机内存只有 `16G/32G` 左右，因此这样一个进程也创建不了。
+
+`x86_64` 架构采用多级页表避免了这种情况。
+
+如下，我们使用一个简单的模型来介绍多级页表：假设一个页面大小为 `100B`，虚拟地址空间为 `1600B`，这种情况如果采用单层页表，结果为：
+
+![](https://pic.imgdb.cn/item/65e41f059f345e8d0350a4de.jpg)
+
+假设多级页表为每 4 个页面归为 1 组的 2 级结构，如图：
+
+![](https://pic.imgdb.cn/item/65e41f589f345e8d035185e4.jpg)
+
+随着虚拟内存使用量增加到一定程度，多级页表的内存使用量就会超过单层页表，但这种情况比较罕见。`x86_64` 的页表结构达到了 4 级，这里不涉及。
+
+可以通过 `sar -r ALL ` 命令中的 `kbpgtbl`查看 **页表使用的内存量**
+
+![](https://pic.imgdb.cn/item/65e4204e9f345e8d0354eefc.jpg)
+
+> kbpgtbl (kb-pg-tbl) ：表示当所有进程页表使用的内存量(KB)
+
+#### 5.6 标准大页
+
+随着进程虚拟内存不断增加，进程页表使用的物理内存量也会增加。
+
+此时，除了内存使用量增加的问题外，还存在 `fork()` 系统调用的执行速度变慢的问题，因为 `fork()` 写时复制需要为子进程复制一份和父进程同样大小的页表。为了解决这个问题，Linux 提供了标准大页。
+
+例如：
+
+![](https://pic.imgdb.cn/item/65e4226a9f345e8d035b7d90.jpg)
+
+可以看到，页表项的数量由 20 个减小到 4 个，将葡普通页面置换成标准大页，不但能降低页表的内存使用量，还能提高 `fork()` 系统调用的执行速度。
+
+**如何使用**
+
+C/C++ 中可以：
+
+```c++
+ char *addr = (char*)mmap(NULL, 2 * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_HUGETLB, fd, 0);
+```
+
+**透明大页**
+
+当虚拟地址空间内连续多个 4KB 的页面符合特定条件时，通过透明大页机制能将它们自动换成一个大页。
+
+这虽然看起来非常便利，但是存在一些问腿：将多个页面汇聚成一个大页的处理，以及不满足上述条件时，将大页重新拆分成多个 4KB 的页面的处理，会引起局部性能下降。因此搭建系统时候，有时会选择禁用透明大页。
+
+![](https://pic.imgdb.cn/item/65e425099f345e8d036325fb.jpg)
+
+希望禁用该功能，只需要往该文件写入 `never`
+
+```bash
+syz@syz:~/projects/class5$ sudo su // 切换到超级用户
+[sudo] password for syz:
+root@syz:/home/syz/projects/class5# echo never >/sys/kernel/mm/transparent_hugepage/enabled
+root@syz:/home/syz/projects/class5# exit // 退出
+exit
+syz@syz:~/projects/class5$ cat /sys/kernel/mm/transparent_hugepage/enabled
+always madvise [never]
+```
+
+设定为 `madvise` 时候表示仅对由 `madvise()` 系统调用设定的内存区域启用透明大页机制。
+
