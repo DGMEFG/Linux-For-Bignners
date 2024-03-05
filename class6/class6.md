@@ -409,3 +409,74 @@ Linux 5.15.133.1-microsoft-standard-WSL2 (syz)  03/04/24        _x86_64_        
 
 可以看到此时没有对于存储器写入的操作 (`wkB/s`)
 
+## 调优参数
+
+Linux 提供了很多用于控制页面缓存的调优参数：
+
+**脏页的回写周期**
+
+```bash
+syz@syz:~$ sysctl vm.dirty_writeback_centisecs
+vm.dirty_writeback_centisecs = 500
+```
+
+参数默认值为 500，即每 5secs 执行一次回写。
+
+你可以通过：`sudo sysctl -w vm.dirty_writeback_centisecs=300` 进行修改。
+
+> 请不要把参数设置为 `0`，否则周期性回写将会被禁用。
+
+Linux 也会当系统内存不足时防止剧烈回写负荷的参数值，`vm.dirty_background_ratio` 可以指定一个百分值，当脏页所占的内存比例超过这个值就会执行回写操作，参数默认值为 `10%`
+
+```bash
+syz@syz:~$ sysctl vm.dirty_background_ratio
+vm.dirty_background_ratio = 10
+```
+
+> `vm.dirty_background_bytes` 以字节为单位来设置该值，其默认值为 `0` 表示不启用
+
+当脏页的内存占比超过 `vm.dirty_ratio` 参数指定的百分比值，将阻塞进程的写入，直到一定量的脏页被写回。
+
+> 同样可以使用 `vm.dirty_bytes` 设置该值。
+
+通过优化这些参数能够让系统不至于在内存不足的情况下出现大量的脏页回写，从而导致性能下降。
+
+**清除页面缓存**
+
+```bash
+syz@syz:~$ sudo su
+[sudo] password for syz:
+root@syz:/home/syz# free
+               total        used        free      shared  buff/cache   available
+Mem:         7942512      539720     6969052        3368      433740     7166044
+Swap:        2097152           0     2097152
+root@syz:/home/syz# echo 3 >/proc/sys/vm/drop_caches
+root@syz:/home/syz# free
+               total        used        free      shared  buff/cache   available
+Mem:         7942512      528912     7262540        3368      151060     7205288
+Swap:        2097152           0     2097152
+root@syz:/home/syz# exit
+exit
+syz@syz:~$
+```
+
+## 超线程
+
+当我们使用 `time` 命令显示计入 `user` 和 `sys` 的 CPU 使用时间中，大部分时间浪费在等待数据从内存或高速缓存传输至 CPU 的过程。
+
+`top` 命令的 `%cpu` 或者 `sar -P ` 命令中的 `%user`  和 `%system` 字段也包含等待数据传输的时间。通过超线程功能可以充分利用这些浪费等待上的 CPU 资源。
+
+> 超线程与进程上的线程毫无关系。
+
+使用超线程功能后，可以为 CPU 核心提供多份硬件资源(其中包括一部分 CPU 核心使用的硬件资源，例如寄存器)，然后将其划分为多个会被系统识别为逻辑 CPU 的超线程。符合这些特殊条件时，可以同时运行多个超线程。
+
+> 超线程可能导致性能下降的例子通常涉及以下情况：
+>
+> 1. **密集型浮点运算：** 在进行大量浮点运算的情况下，超线程可能会导致性能下降。这是因为超线程技术只复制了部分 CPU 核心的硬件资源，对于某些密集型计算任务，两个逻辑处理单元共享了部分硬件资源，导致资源竞争和效率降低。
+> 2. **大量内存访问的任务：** 对于需要大量内存访问的任务，超线程也可能导致性能下降。因为两个逻辑处理单元共享了同一个物理核心的缓存等资源，在大量内存访问的情况下可能会导致缓存争用，进而影响性能。
+> 3. **同类任务并行执行：** 当两个逻辑处理单元同时执行相似的任务时，由于它们共享一些硬件资源，可能会导致资源竞争，从而降低整体性能。
+
+搭建系统时，有必要实际施加负载，来比较一下超线程启用时和禁用时的性能区别，再确定是否启用该功能。
+
+
+
