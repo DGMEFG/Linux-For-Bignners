@@ -34,3 +34,22 @@ sudo apt install binutils build-essential sysstat
 * 输入命令：`:'<,'>w !clip.exe`
 
 [参考](https://blog.csdn.net/AngelLover2017/article/details/122072001)
+
+---
+
+cgroupfs 辅助工具包
+
+`sudo apt install cgroup-tools` 
+
+**cgcreate**
+
+```bash
+cgcreate -g <subsystem_path>:<cgroup_name>
+```
+
+**cgdelete**
+
+```bash
+cgdelete -g <subsystem_path>:<cgroup_name>
+```
+
